@@ -1,0 +1,305 @@
+import os
+import time
+import matplotlib
+
+# إعداد Matplotlib للعمل في الخلفية في السحابة
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import pandas as pd
+import requests
+import streamlit as st
+
+# إعداد الصفحة وتصميم الواجهة
+st.set_page_config(
+    page_title="منظومة نوبات - مكتب المحافظ", page_icon="🏛️", layout="centered"
+)
+
+# إعداد المجلدات المؤقتة على الخادم السحابي
+UPLOAD_FOLDER = "uploads"
+REPORT_FOLDER = "reports"
+CHART_FOLDER = "charts"
+
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(REPORT_FOLDER, exist_ok=True)
+os.makedirs(CHART_FOLDER, exist_ok=True)
+
+
+# ==========================================
+# وظيفة توليد الرسم البياني الإحصائي
+# ==========================================
+def generate_statistics_chart(report_df, chart_filename):
+  try:
+    summary = (
+        report_df.groupby(["المنطقة / القضاء", "حالة الإرسال"])
+        .size()
+        .unstack(fill_value=0)
+    )
+
+    if summary.empty:
+      return None
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    summary.plot(
+        kind="bar",
+        ax=ax,
+        color=["#10b981", "#ef4444"],
+        edgecolor="black",
+        width=0.7,
+    )
+
+    ax.set_title(
+        "إحصائيات إرسال طلبات المواطنين حسب القضاء والمنطقة",
+        fontsize=14,
+        fontweight="bold",
+        pad=15,
+    )
+    ax.set_xlabel("المنطقة / القضاء", fontsize=12)
+    ax.set_ylabel("عدد المواطنين", fontsize=12)
+    ax.legend(["نجاح الإرسال", "فشل الإرسال"], title="الحالة")
+    plt.xticks(rotation=45, ha="right")
+    plt.grid(axis="y", linestyle="--", alpha=0.7)
+    plt.tight_layout()
+
+    chart_path = os.path.join(CHART_FOLDER, chart_filename)
+    plt.savefig(chart_path, dpi=300)
+    plt.close(fig)
+    return chart_path
+  except Exception as e:
+    st.error(f"خطأ في توليد الرسم البياني: {e}")
+    return None
+
+
+# ==========================================
+# وظيفة إرسال الحملة وتوليد التقرير
+# ==========================================
+def send_whatsapp_campaign(
+    df, image_path, token, phone_id, selected_region, status_container
+):
+  headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+  whatsapp_url = f"https://graph.facebook.com/v17.0/{phone_id}/messages"
+
+  report_data = []
+  screen_logs = []
+
+  region_column = None
+  for col in ["عنوان السكن الدقيق", "القضاء", "المنطقة", "الناحية"]:
+    if col in df.columns:
+      region_column = col
+      break
+
+  if selected_region and selected_region != "ALL" and region_column:
+    df_filtered = df[
+        df[region_column].astype(str).str.contains(selected_region, na=False)
+    ].copy()
+    screen_logs.append(
+        f"📍 تم الفلترة الجغرافية على: '{selected_region}' (المستهدفون:"
+        f" {len(df_filtered)} من أصل {len(df)})"
+    )
+  else:
+    df_filtered = df.copy()
+    screen_logs.append(f"🌐 إرسال لكافة السجلات (العدد الكلي: {len(df_filtered)})")
+
+  if len(df_filtered) == 0:
+    return (
+        screen_logs + ["⚠️ لا يوجد مواطنون مطابقون لخيارات الفلترة المحددة."],
+        None,
+        None,
+    )
+
+  # رفع الصورة مؤقتاً أو استخدام رابط عام (في Streamlit يفضل حفظها مؤقتاً واستخدام رابط الخدمة)
+  # هنا سنعتمد على المسار المحلي المرفوع
+  image_url = f"https://raw.githubusercontent.com/..."  # أو رابط استضافة مؤقت، وللتبسيط السحابي سنقوم بتمرير الرابط المرفوع
+
+  progress_bar = status_container.progress(0)
+  total_rows = len(df_filtered)
+
+  for i, (index, row) in enumerate(df_filtered.iterrows()):
+    name = f"{row.get('الاسم الثلاثي', '')} {row.get('اللقب', '')}".strip()
+    phone = str(row.get("رقم الموبايل", "")).strip()
+    order_type = row.get("نوع الطلب", "خدمي وعام")
+    region = row.get(region_column, "غير محدد") if region_column else "عام"
+
+    if not phone or phone == "nan":
+      report_data.append({
+          "الاسم الثلاثي": name,
+          "رقم الموبايل": phone,
+          "المنطقة / القضاء": region,
+          "نوع الطلب": order_type,
+          "حالة الإرسال": "فشل",
+          "التفاصيل / السبب": "رقم الهاتف غير متاح",
+      })
+      continue
+
+    clean_phone = phone.replace("+", "").replace(" ", "")
+    if clean_phone.startswith("0"):
+      clean_phone = "964" + clean_phone[1:]
+
+    caption = (
+        f"أهلاً بك أستاذ {name}،\n\n"
+        f"نود إعلامك بأن طلبكم الخاص بـ ({order_type}) المقدم عن منطقة ({region}) تم استلامه رسمياً، وهو قيد المتابعة والاهتمام المباشر من قبل مكتب السيد المحافظ.\n\n"
+        "مكتب متابعة شؤون المواطنين - محافظة كربلاء المقدسة"
+    )
+
+    # ملاحظة: في واجهة Meta API الفعلية يلزم رابط صورة عام (Public URL).
+    # للتجربة السحابية، سنفترض توفر رابط الصورة المباشر أو الـ Image ID.
+    payload = {
+        "messaging_product": "whatsapp",
+        "recipient_type": "individual",
+        "to": clean_phone,
+        "type": "image",
+        "image": {"link": image_path, "caption": caption},
+    }
+
+    try:
+      response = requests.post(
+          whatsapp_url, headers=headers, json=payload, timeout=30
+      )
+      res_json = response.json()
+
+      if response.status_code == 200:
+        status = "نجاح"
+        detail = f"تم الإرسال (ID: {res_json.get('messages', [{}])[0].get('id', 'N/A')})"
+        screen_logs.append(f"✅ تم الإرسال بنجاح إلى: {name} ({clean_phone})")
+      else:
+        status = "فشل"
+        detail = res_json.get("error", {}).get(
+            "message", "خطأ في الاتصال بالـ API"
+        )
+        screen_logs.append(f"❌ فشل الإرسال إلى {name}: {detail}")
+    except Exception as req_err:
+      status = "فشل"
+      detail = str(req_err)
+      screen_logs.append(f"⚠️ خطأ شبكي مع {name}: {detail}")
+
+    report_data.append({
+        "الاسم الثلاثي": name,
+        "رقم الموبايل": clean_phone,
+        "المنطقة / القضاء": region,
+        "نوع الطلب": order_type,
+        "حالة الإرسال": status,
+        "التفاصيل / السبب": detail,
+    })
+
+    progress_bar.progress((i + 1) / total_rows)
+    time.sleep(4)
+
+  report_df = pd.DataFrame(report_data)
+  timestamp = int(time.time())
+  report_filename = os.path.join(REPORT_FOLDER, f"campaign_report_{timestamp}.xlsx")
+  report_df.to_excel(report_filename, index=False)
+
+  chart_filename = f"chart_{timestamp}.png"
+  generated_chart_path = generate_statistics_chart(report_df, chart_filename)
+
+  return screen_logs, report_filename, generated_chart_path
+
+
+# ==========================================
+# واجهة مستخدم التطبيق (Streamlit UI)
+# ==========================================
+st.title("🏛️ منظومة إدارة وإرسال طلبات المواطنين")
+st.markdown("### **مكتب متابعة شؤون المواطنين - محافظة كربلاء المقدسة**")
+st.markdown("---")
+
+# إدخال بيانات الـ API في الشريط الجانبي (Sidebar) لتوفير المساحة على الموبايل
+st.sidebar.header("⚙️ إعدادات الربط والاتصال")
+whatsapp_token = st.sidebar.text_input(
+    "WhatsApp Cloud API Token", type="password"
+)
+phone_number_id = st.sidebar.text_input("Phone Number ID")
+
+st.markdown("#### 📁 الخطوة الأولى: رفع ملف المواطنين (Excel)")
+uploaded_excel = st.file_uploader(
+    "اختر ملف الإكسل الخاص بالمواطنين (.xlsx)", type=["xlsx", "xls"]
+)
+
+regions_list = ["ALL"]
+df = None
+
+if uploaded_excel is not None:
+  try:
+    df = pd.read_excel(uploaded_excel)
+    region_col = None
+    for col in ["عنوان السكن الدقيق", "القضاء", "المنطقة", "الناحية"]:
+      if col in df.columns:
+        region_col = col
+        break
+
+    if region_col:
+      unique_regs = df[region_col].dropna().unique().tolist()
+      regions_list.extend(unique_regs)
+
+    st.success(
+        f"✅ تم قراءة الملف بنجاح! إجمالي السجلات: {len(df)} مواطن ومواطنة."
+    )
+  except Exception as e:
+    st.error(f"خطأ في قراءة ملف الإكسل: {e}")
+
+selected_region = st.selectbox(
+    "📍 فلترة المستهدفين حسب المنطقة / القضاء:",
+    regions_list,
+    format_func=lambda x: (
+        "🌐 كافة المناطق والأقضية (بدون فرز)" if x == "ALL" else x
+    ),
+)
+
+st.markdown("---")
+st.markdown("#### 🖼️ الخطوة الثانية: كتاب أو إيصال الطلب الرسمي")
+uploaded_image = st.file_uploader(
+    "اختر صورة الإيصال أو الكتاب (.png, .jpg)", type=["png", "jpg", "jpeg"]
+)
+
+image_public_link = st.text_input(
+    "🔗 رابط الصورة العام (Public URL):",
+    placeholder=(
+        "ألصق هنا رابطاً عاماً للصورة المرفوعة ليتم إرسالها عبر WhatsApp API"
+    ),
+)
+
+st.markdown("---")
+
+# زر بدء الحملة
+if st.button("🚀 بدء حملة الإرسال وتوليد الإحصائيات البيانية", type="primary"):
+  if not whatsapp_token or not phone_number_id:
+    st.warning("⚠️ يرجى إدخال رمز الـ Token ومعرف الهاتف في الشريط الجانبي أولاً.")
+  elif df is None:
+    st.warning("⚠️ يرجى رفع ملف إكسل للمواطنين أولاً.")
+  elif not image_public_link:
+    st.warning("⚠️ يرجى إدخال رابط الصورة العام المباشر.")
+  else:
+    st.info("🔄 جاري إرسال الرسائل وتحديث لوحة الإحصائيات، يرجى الانتظار...")
+    status_container = st.empty()
+
+    logs, report_path, chart_path = send_whatsapp_campaign(
+        df,
+        image_public_link,
+        whatsapp_token,
+        phone_number_id,
+        selected_region,
+        status_container,
+    )
+
+    st.markdown("---")
+    st.subheader("📊 لوحة الإحصائيات البيانية لنجاح الطلبات")
+    if chart_path and os.path.exists(chart_path):
+      st.image(
+          chart_path,
+          caption="توزيع حالات الإرسال والنجاح بحسب الأقضية",
+          use_container_width=True,
+      )
+
+    st.subheader("📥 تقرير الحملة النهائي")
+    if report_path and os.path.exists(report_path):
+      with open(report_path, "rb") as f:
+        st.download_button(
+            label="تحميل تقرير الإرسال النهائي (Excel)",
+            data=f,
+            file_name="Nawbat_Campaign_Final_Report.xlsx",
+            mime=(
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            ),
+        )
+
+    with st.expander("📄 عرض سجلات التنفيذ التفصيلية (Execution Logs)"):
+      for log in logs:
+        st.text(log)
